@@ -7,7 +7,13 @@ use openxr::{
 };
 use quark::{Hooked as _, Low as _, prelude::XrResult, try_xr, types::AnySession};
 use smallvec::smallvec;
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::HashSet,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 use vulkano::{
     Handle as _, VulkanObject,
     command_buffer::{
@@ -23,6 +29,35 @@ use vulkano::{
 };
 
 use crate::api_layer::{CameraResources, PassthroughInner, XrErr, xrcvt};
+
+fn psvr2_camera_latency_offset_ns() -> u64 {
+    static OFFSET: OnceLock<u64> = OnceLock::new();
+    *OFFSET.get_or_init(|| {
+        let milliseconds = std::env::var("PSVR2_PASSTHROUGH_LATENCY_OFFSET_MS")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite())
+            .unwrap_or(0.0)
+            .clamp(0.0, 100.0);
+        (milliseconds * 1_000_000.0).round() as u64
+    })
+}
+
+fn psvr2_reprojection_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("PSVR2_PASSTHROUGH_REPROJECTION")
+            .ok()
+            .is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+    })
+}
+
+static PSVR2_REPROJECTION_LOGGED: AtomicBool = AtomicBool::new(false);
 
 #[allow(clippy::large_enum_variant)]
 enum SessionState {
@@ -50,47 +85,88 @@ struct SessionDataInner {
     space: openxr::Space,
 }
 impl SessionDataInner {
+    fn camera_config_for_source() -> Option<&'static crate::steam::StereoCamera> {
+        if std::env::var_os("PSVR2_CAMERA_SHARE_PATH").is_some() {
+            None
+        } else {
+            PassthroughInner::camera_cfg()
+        }
+    }
+
     fn create_camera_resources(
         &self,
         camera_cfg: Option<&crate::steam::StereoCamera>,
         splash: &[u8],
         size: UVec2,
     ) -> Result<CameraResources, XrErr> {
+        let psvr2_path = std::env::var_os("PSVR2_CAMERA_SHARE_PATH");
+        let is_psvr2 = psvr2_path.is_some();
+        let source_size = if is_psvr2 {
+            // Pipeline sizes are per eye; the shared image stores two 1016-wide
+            // BC4 eyes side by side.
+            UVec2::new(1016, 1016)
+        } else {
+            UVec2::new(crate::CAMERA_SIZE, crate::CAMERA_SIZE)
+        };
+        let camera_cfg = (!is_psvr2).then_some(camera_cfg).flatten();
+        let (camera, psvr2_calibration) = if let Some(path) = psvr2_path {
+            let (camera, calibration) =
+                crate::camera::CameraThread::new_psvr2(std::path::Path::new(&path), splash)
+                    .map_err(|e| {
+                        warn!("Failed to open PSVR2 camera stream {e:#}");
+                        XrErr::ERROR_RUNTIME_FAILURE
+                    })?;
+            (camera, Some(calibration))
+        } else {
+            let camera_path = crate::find_index_camera().map_err(|e| {
+                warn!("Cannot find camera {e:#}");
+                XrErr::ERROR_RUNTIME_FAILURE
+            })?;
+            let camera_device = v4l::Device::with_path(camera_path).map_err(|e| {
+                warn!("Failed to open camera {e:#}");
+                XrErr::ERROR_RUNTIME_FAILURE
+            })?;
+            (
+                crate::camera::CameraThread::new(camera_device, splash),
+                None,
+            )
+        };
         let xdg = xdg::BaseDirectories::new();
         let pipeline_cache =
             crate::config::load_pipeline_cache(&self.device, &xdg).map_err(|e| {
                 warn!("Failed to load pipeline cache {e:#}");
                 XrErr::ERROR_RUNTIME_FAILURE
             })?;
+        let render_size = if is_psvr2 { source_size } else { size };
         let pp = crate::pipeline::Pipeline::new(
             &self.device,
             &self.allocator,
             &self.cmdbuf_allocator,
             &self.queue,
             &self.descriptor_set_allocator,
-            true,
+            if is_psvr2 {
+                crate::FrameFormat::Bc4
+            } else {
+                crate::FrameFormat::Yuyv
+            },
             camera_cfg,
+            psvr2_calibration.as_ref(),
             ImageLayout::ShaderReadOnlyOptimal,
             ImageUsage::SAMPLED | ImageUsage::TRANSFER_SRC,
             pipeline_cache,
-            UVec2::new(crate::CAMERA_SIZE, crate::CAMERA_SIZE),
-            size,
+            source_size,
+            render_size,
         )
         .map_err(|e| {
             warn!("Failed to create pipeline {e:#}");
             XrErr::ERROR_RUNTIME_FAILURE
         })?;
-        let camera = crate::find_index_camera().map_err(|e| {
-            warn!("Cannot find camera {e:#}");
-            XrErr::ERROR_RUNTIME_FAILURE
-        })?;
-        let camera = v4l::Device::with_path(camera).map_err(|e| {
-            warn!("Failed to open camera {e:#}");
-            XrErr::ERROR_RUNTIME_FAILURE
-        })?;
-        let camera = crate::camera::CameraThread::new(camera, splash);
         camera.resume().unwrap();
-        Ok(CameraResources { camera, pp })
+        Ok(CameraResources {
+            camera,
+            pp,
+            blit_future: None,
+        })
     }
     /// Transition `[Self::Running]` or `[Self::Idle]` states into `[Self::RunningWithPassthrough]`
     /// and `[Self::IdleWithPassthrough]` respectively.
@@ -108,7 +184,7 @@ impl SessionDataInner {
                     passthrough.0.clone()
                 } else {
                     let camera = self.create_camera_resources(
-                        PassthroughInner::camera_cfg(),
+                        Self::camera_config_for_source(),
                         PassthroughInner::splash(),
                         size,
                     )?;
@@ -151,7 +227,7 @@ impl SessionDataInner {
                 let size = UVec2::new(width, height);
                 let passthrough = if let Some(p) = passthrough {
                     let camera = self.create_camera_resources(
-                        PassthroughInner::camera_cfg(),
+                        Self::camera_config_for_source(),
                         PassthroughInner::splash(),
                         size,
                     )?;
@@ -364,6 +440,7 @@ impl SessionData {
             return Err(XrErr::ERROR_SESSION_NOT_RUNNING);
         };
         let (_, camera) = passthrough.as_mut().unwrap();
+        let camera_frame = camera.camera.frame();
 
         let (view_state_flags, view_locations) =
             xr_vk_session.locate_views(*view_type, info.display_time, &data.space)?;
@@ -391,6 +468,48 @@ impl SessionData {
             info.environment_blend_mode = EnvironmentBlendMode::OPAQUE;
             return xrcvt(unsafe { (instance.fp().end_frame)(session.as_handle(), &info) });
         }
+        let capture_view_locations = if psvr2_reprojection_enabled() {
+            camera_frame
+                .capture_timestamp_ns
+                .filter(|_| {
+                    camera_frame
+                        .capture_time
+                        .is_some_and(|capture_time| capture_time.elapsed().as_millis() <= 1_000)
+                })
+                .and_then(|timestamp_ns| {
+                    let corrected_timestamp_ns =
+                        timestamp_ns.saturating_sub(psvr2_camera_latency_offset_ns());
+                    let capture_time = openxr::Time::from_nanos(corrected_timestamp_ns as i64);
+                    xr_vk_session
+                        .locate_views(*view_type, capture_time, &data.space)
+                        .ok()
+                })
+                .filter(|(flags, views)| {
+                    views.len() == 2
+                        && flags.contains(
+                            ViewStateFlags::POSITION_VALID | ViewStateFlags::ORIENTATION_VALID,
+                        )
+                })
+                .map(|(_, views)| views)
+        } else {
+            None
+        };
+        if capture_view_locations.is_some()
+            && !PSVR2_REPROJECTION_LOGGED.swap(true, Ordering::Relaxed)
+        {
+            let age_ms = camera_frame
+                .capture_time
+                .map(|capture_time| capture_time.elapsed().as_secs_f64() * 1_000.0)
+                .unwrap_or_default();
+            log::info!(
+                "PSVR2 capture-time reprojection active: frame age {:.1}ms, offset {:.1}ms",
+                age_ms,
+                psvr2_camera_latency_offset_ns() as f64 / 1_000_000.0
+            );
+        }
+        let passthrough_view_locations = capture_view_locations
+            .as_deref()
+            .unwrap_or(view_locations.as_slice());
         let image_index = image_index.take().unwrap();
         // Copy camera image to swapchain
         let mut cmdbuf = AutoCommandBufferBuilder::primary(
@@ -402,7 +521,6 @@ impl SessionData {
             warn!("Failed to create command buffer {e:#}");
             XrErr::ERROR_RUNTIME_FAILURE
         })?;
-        let camera_frame = camera.camera.frame();
         camera.pp.maybe_postprocess(&camera_frame).map_err(|e| {
             warn!("Failed to postprocess camera frame {e:#}");
             XrErr::ERROR_RUNTIME_FAILURE
@@ -430,27 +548,39 @@ impl SessionData {
             warn!("Failed to build command buffer {e:#}");
             XrErr::ERROR_RUNTIME_FAILURE
         })?;
-        fut.then_execute(data.queue.clone(), cmdbuf)
-            .map_err(|e| {
-                warn!("Failed to execute command buffer {e:#}");
-                XrErr::ERROR_RUNTIME_FAILURE
-            })?
-            .then_signal_fence_and_flush()
-            .map_err(|e| {
-                warn!("Failed to flush command buffer {e:#}");
-                XrErr::ERROR_RUNTIME_FAILURE
-            })?
-            .wait(None)
-            .map_err(|e| {
-                warn!("Failed to wait for fence {e:#}");
-                XrErr::ERROR_RUNTIME_FAILURE
-            })?;
+        if let Some(previous) = camera.blit_future.as_mut() {
+            previous.cleanup_finished();
+        }
+        camera.blit_future = Some(
+            fut.then_execute(data.queue.clone(), cmdbuf)
+                .map_err(|e| {
+                    warn!("Failed to execute command buffer {e:#}");
+                    XrErr::ERROR_RUNTIME_FAILURE
+                })?
+                .then_signal_fence_and_flush()
+                .map_err(|e| {
+                    warn!("Failed to flush command buffer {e:#}");
+                    XrErr::ERROR_RUNTIME_FAILURE
+                })?
+                .boxed_send_sync(),
+        );
         assert_eq!(view_locations.len(), 2);
         swapchain.release_image()?;
         log::trace!("{:?}", view_locations[0].fov);
         log::trace!("{:?}", view_locations[1].fov);
         log::trace!("{:?}", view_locations[0].pose);
         log::trace!("{:?}", view_locations[1].pose);
+        let passthrough_fov = camera.pp.psvr2_projection_fov();
+        let projection_fov = |eye: usize| {
+            passthrough_fov
+                .map(|fov| openxr::Fovf {
+                    angle_left: fov[eye][0],
+                    angle_right: fov[eye][1],
+                    angle_up: fov[eye][2],
+                    angle_down: fov[eye][3],
+                })
+                .unwrap_or(view_locations[eye].fov)
+        };
         let views = [
             openxr::CompositionLayerProjectionView::new()
                 .sub_image(
@@ -464,8 +594,8 @@ impl SessionData {
                             },
                         }),
                 )
-                .pose(view_locations[0].pose)
-                .fov(view_locations[0].fov),
+                .pose(passthrough_view_locations[0].pose)
+                .fov(projection_fov(0)),
             openxr::CompositionLayerProjectionView::new()
                 .sub_image(
                     SwapchainSubImage::new()
@@ -481,8 +611,8 @@ impl SessionData {
                             },
                         }),
                 )
-                .pose(view_locations[1].pose)
-                .fov(view_locations[1].fov),
+                .pose(passthrough_view_locations[1].pose)
+                .fov(projection_fov(1)),
         ];
 
         let replaced_passthrough_layer = openxr::CompositionLayerProjection::new()

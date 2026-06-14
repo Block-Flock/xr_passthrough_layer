@@ -12,11 +12,22 @@ pub const CAMERA_SIZE: u32 = 960;
 use glam::UVec2;
 #[allow(unused_imports)]
 use log::info;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameFormat {
+    Rgba8,
+    Yuyv,
+    Bc4,
+}
+
 pub struct FrameInfo {
     pub frame: Vec<u8>,
     pub frame_time: std::time::Instant,
+    pub capture_time: Option<std::time::Instant>,
+    pub capture_timestamp_ns: Option<u64>,
+    pub ipd_m: Option<f32>,
     pub size: UVec2,
     pub needs_postprocess: bool,
+    pub format: FrameFormat,
 }
 
 pub fn find_index_camera() -> Result<std::path::PathBuf> {
@@ -35,6 +46,10 @@ pub fn find_index_camera() -> Result<std::path::PathBuf> {
     let devnode = dev
         .devnode()
         .with_context(|| anyhow!("Index camera cannot be accessed"))?;
-    log::info!("Index camera is {}, {}", devnode.display(), dev.syspath().display());
+    log::info!(
+        "Index camera is {}, {}",
+        devnode.display(),
+        dev.syspath().display()
+    );
     Ok(devnode.to_owned())
 }

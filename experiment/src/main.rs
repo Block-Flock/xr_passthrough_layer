@@ -6,7 +6,9 @@ use std::{collections::HashSet, sync::Arc};
 
 use anyhow::{Context, Result, anyhow};
 
-use ::xr_passthrough_layer::{CAMERA_SIZE, camera, find_index_camera, pipeline, steam};
+use ::xr_passthrough_layer::{
+    CAMERA_SIZE, FrameFormat, camera, find_index_camera, pipeline, steam,
+};
 use glam::UVec2;
 use v4l::video::Capture;
 use vulkano::{
@@ -275,7 +277,7 @@ fn main() -> Result<()> {
         v4l::FourCC::new(b"YUYV"),
     ))?;
     let pipeline_cache =
-        xr_passthrough_layer::config::load_pipeline_cache(&device, &xdg::BaseDirectories::new()?)?;
+        xr_passthrough_layer::config::load_pipeline_cache(&device, &xdg::BaseDirectories::new())?;
     let camera_config = steam::find_steam_config();
     log::info!("{}", format);
     let pp = pipeline::Pipeline::new(
@@ -284,8 +286,9 @@ fn main() -> Result<()> {
         &cmdbuf_allocator,
         &queue,
         &descriptor_set_allocator,
-        true,
-        camera_config,
+        FrameFormat::Yuyv,
+        camera_config.as_ref(),
+        None,
         ImageLayout::TransferSrcOptimal,
         ImageUsage::TRANSFER_SRC,
         pipeline_cache,

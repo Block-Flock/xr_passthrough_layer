@@ -5,7 +5,7 @@ use glam::{
 use smallvec::smallvec;
 use std::sync::Arc;
 
-use crate::{steam::StereoCamera, utils::DeviceExt as _};
+use crate::{FrameFormat, camera::Psvr2Calibration, steam::StereoCamera, utils::DeviceExt as _};
 use anyhow::Result;
 use log::{info, trace};
 use vulkano::{
@@ -44,7 +44,7 @@ use vulkano::{
         cache::PipelineCache,
         graphics::{
             GraphicsPipelineCreateInfo,
-            color_blend::ColorBlendState,
+            color_blend::{ColorBlendAttachmentState, ColorBlendState},
             input_assembly::{InputAssemblyState, PrimitiveTopology},
             subpass::PipelineSubpassType,
             vertex_input::{self, Vertex as _, VertexDefinition},
@@ -65,6 +65,58 @@ struct StereoUndistortParams {
     focal: [Vec2; 2],
     center: [Vec2; 2],
     coeff: [Vec4; 2],
+}
+
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+struct Psvr2GpuCalibration {
+    intrinsics: [[f32; 4]; 2],
+    coefficients: [[f32; 4]; 10],
+    head_to_camera: [[[f32; 4]; 4]; 2],
+    camera_position: [[f32; 4]; 2],
+    eye_and_depth: [f32; 4],
+    rectified_intrinsics: [f32; 4],
+    image_quality: [f32; 4],
+}
+
+impl Psvr2GpuCalibration {
+    fn env_float(name: &str, default: f32, min: f32, max: f32) -> f32 {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok())
+            .filter(|value| value.is_finite())
+            .unwrap_or(default)
+            .clamp(min, max)
+    }
+
+    fn new(calibration: &Psvr2Calibration) -> Self {
+        let mut coefficients = [[0.0; 4]; 10];
+        for eye in 0..2 {
+            for coefficient in 0..20 {
+                coefficients[eye * 5 + coefficient / 4][coefficient % 4] =
+                    calibration.distortion[eye][coefficient] as f32;
+            }
+        }
+        let convergence_depth = std::env::var("PSVR2_PASSTHROUGH_CONVERGENCE_M")
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok())
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .unwrap_or(0.0);
+        Self {
+            intrinsics: calibration.intrinsics,
+            coefficients,
+            head_to_camera: calibration.head_to_camera,
+            camera_position: calibration.camera_position,
+            eye_and_depth: [calibration.ipd_m, convergence_depth, 0.0, 0.0],
+            rectified_intrinsics: calibration.rectified_intrinsics(),
+            image_quality: [
+                Self::env_float("PSVR2_PASSTHROUGH_BRIGHTNESS", 1.6, 0.5, 4.0),
+                Self::env_float("PSVR2_PASSTHROUGH_CONTRAST", 1.4, 0.5, 3.0),
+                Self::env_float("PSVR2_PASSTHROUGH_UNSHARP", 0.3, 0.0, 1.0),
+                Self::env_float("PSVR2_PASSTHROUGH_UNSHARP_RADIUS", 1.5, 0.5, 4.0),
+            ],
+        }
+    }
 }
 
 impl StereoUndistortParams {
@@ -190,6 +242,8 @@ pub struct Pipeline {
     /// The input image after post-processing (e.g. undistortion, yuv to rgb conversion)
     postprocessed_image: Arc<VkImage>,
     camera_config: Option<StereoCamera>,
+    psvr2_calibration: Option<Psvr2Calibration>,
+    psvr2_params: Option<Subbuffer<Psvr2GpuCalibration>>,
     allocator: Arc<dyn MemoryAllocator>,
     cmdbuf_allocator: Arc<dyn CommandBufferAllocator>,
     device: Arc<Device>,
@@ -227,15 +281,21 @@ impl Pipeline {
     pub fn load_shader(
         device: &Arc<Device>,
         source_is_yuyv: bool,
+        source_is_psvr2_bc4: bool,
         has_camera_config: bool,
         has_yuyv_sampler: bool,
     ) -> anyhow::Result<(Arc<ShaderModule>, Arc<ShaderModule>)> {
         let vs = vs::load(device)?;
-        let fs = match (source_is_yuyv && !has_yuyv_sampler, has_camera_config) {
-            (true, true) => fs::yuyv_undistort::load(device)?,
-            (true, false) => fs::yuyv::load(device)?,
-            (false, true) => fs::undistort::load(device)?,
-            (false, false) => fs::unprocessed::load(device)?,
+        let fs = match (
+            source_is_psvr2_bc4,
+            source_is_yuyv && !has_yuyv_sampler,
+            has_camera_config,
+        ) {
+            (true, _, _) => fs::psvr2_bc4::load(device)?,
+            (false, true, true) => fs::yuyv_undistort::load(device)?,
+            (false, true, false) => fs::yuyv::load(device)?,
+            (false, false, true) => fs::undistort::load(device)?,
+            (false, false, false) => fs::unprocessed::load(device)?,
         };
         Ok((vs, fs))
     }
@@ -249,8 +309,9 @@ impl Pipeline {
         cmdbuf_allocator: &Arc<dyn CommandBufferAllocator>,
         queue: &Arc<Queue>,
         descriptor_set_allocator: &Arc<impl DescriptorSetAllocator>,
-        source_is_yuyv: bool,
+        source_format: FrameFormat,
         camera_config: Option<&StereoCamera>,
+        psvr2_calibration: Option<&Psvr2Calibration>,
         final_layout: ImageLayout,
         output_usage: ImageUsage,
         pipeline_cache: Arc<PipelineCache>,
@@ -259,24 +320,28 @@ impl Pipeline {
     ) -> Result<Self> {
         let exts = device.enabled_extensions();
         let feats = device.enabled_features();
-        let has_yuyv_sampler =
-            if exts.khr_sampler_ycbcr_conversion && feats.sampler_ycbcr_conversion {
-                let format_feats = device
-                    .physical_device()
-                    .format_properties(Format::G8B8G8R8_422_UNORM)?
-                    .format_features(ImageTiling::Optimal, &[]);
-                format_feats.contains(FormatFeatures::MIDPOINT_CHROMA_SAMPLES)
-            } else {
-                false
-            };
-        let format = if has_yuyv_sampler && source_is_yuyv {
-            Format::G8B8G8R8_422_UNORM
+        let source_is_yuyv = source_format == FrameFormat::Yuyv;
+        let has_yuyv_sampler = if source_is_yuyv
+            && exts.khr_sampler_ycbcr_conversion
+            && feats.sampler_ycbcr_conversion
+        {
+            let format_feats = device
+                .physical_device()
+                .format_properties(Format::G8B8G8R8_422_UNORM)?
+                .format_features(ImageTiling::Optimal, &[]);
+            format_feats.contains(FormatFeatures::MIDPOINT_CHROMA_SAMPLES)
         } else {
-            Format::R8G8B8A8_UNORM
+            false
+        };
+        let format = match source_format {
+            FrameFormat::Yuyv if has_yuyv_sampler => Format::G8B8G8R8_422_UNORM,
+            FrameFormat::Bc4 => Format::BC4_UNORM_BLOCK,
+            FrameFormat::Yuyv | FrameFormat::Rgba8 => Format::R8G8B8A8_UNORM,
         };
         let (vs, fs) = Self::load_shader(
             device,
             source_is_yuyv,
+            source_format == FrameFormat::Bc4,
             camera_config.is_some(),
             has_yuyv_sampler,
         )?;
@@ -284,6 +349,12 @@ impl Pipeline {
         let fs_main = fs.entry_point("main").unwrap();
 
         // Allocate intermediate textures
+        let input_usage = ImageUsage::TRANSFER_DST | ImageUsage::TRANSFER_SRC | ImageUsage::SAMPLED;
+        let input_usage = if source_format == FrameFormat::Bc4 {
+            input_usage
+        } else {
+            input_usage | ImageUsage::COLOR_ATTACHMENT
+        };
         let input_texture = device.new_image(
             &ImageCreateInfo {
                 extent: if source_is_yuyv && !has_yuyv_sampler {
@@ -294,10 +365,7 @@ impl Pipeline {
                     [camera_size.x * 2, camera_size.y, 1]
                 },
                 format,
-                usage: ImageUsage::TRANSFER_DST
-                    | ImageUsage::TRANSFER_SRC
-                    | ImageUsage::SAMPLED
-                    | ImageUsage::COLOR_ATTACHMENT,
+                usage: input_usage,
                 ..Default::default()
             },
             MemoryTypeFilter::PREFER_DEVICE,
@@ -314,10 +382,15 @@ impl Pipeline {
         let cpu_buffer = device.new_buffer(
             &BufferCreateInfo {
                 usage: BufferUsage::TRANSFER_SRC,
-                size: camera_size.x as u64
-                    * camera_size.y as u64
-                    * 2
-                    * if source_is_yuyv { 2 } else { 4 },
+                size: match source_format {
+                    FrameFormat::Yuyv => camera_size.x as u64 * camera_size.y as u64 * 2 * 2,
+                    FrameFormat::Rgba8 => camera_size.x as u64 * camera_size.y as u64 * 2 * 4,
+                    FrameFormat::Bc4 => {
+                        let bx = (camera_size.x * 2).div_ceil(4) as u64;
+                        let by = camera_size.y.div_ceil(4) as u64;
+                        bx * by * 8
+                    }
+                },
                 ..Default::default()
             },
             MemoryTypeFilter::HOST_SEQUENTIAL_WRITE | MemoryTypeFilter::PREFER_DEVICE,
@@ -396,6 +469,25 @@ impl Pipeline {
                 .map_err(anyhow::Error::from)
             })
             .transpose()?;
+        let psvr2_params = psvr2_calibration
+            .map(|calibration| {
+                Buffer::from_data(
+                    allocator,
+                    &BufferCreateInfo {
+                        usage: BufferUsage::UNIFORM_BUFFER,
+                        ..Default::default()
+                    },
+                    &AllocationCreateInfo {
+                        memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE
+                            | MemoryTypeFilter::PREFER_DEVICE,
+                        allocate_preference: MemoryAllocatePreference::Unknown,
+                        ..Default::default()
+                    },
+                    Psvr2GpuCalibration::new(calibration),
+                )
+                .map_err(anyhow::Error::from)
+            })
+            .transpose()?;
         let pipeline = GraphicsPipeline::new(
             device,
             Some(&pipeline_cache),
@@ -419,7 +511,7 @@ impl Pipeline {
                 )),
                 multisample_state: Some(&Default::default()),
                 color_blend_state: Some(&ColorBlendState {
-                    attachments: &[Default::default()],
+                    attachments: &[ColorBlendAttachmentState::default()],
                     ..Default::default()
                 }),
                 rasterization_state: Some(&Default::default()),
@@ -447,6 +539,15 @@ impl Pipeline {
                 .as_ref()
                 .map(|i| WriteDescriptorSet::buffer(2, i));
             desc_set_writes.extend(distortion_params_buffer_descriptor);
+            let psvr2_params_buffer_info =
+                psvr2_params.as_ref().map(|buffer| DescriptorBufferInfo {
+                    buffer: Some(buffer.buffer()),
+                    ..Default::default()
+                });
+            let psvr2_params_buffer_descriptor = psvr2_params_buffer_info
+                .as_ref()
+                .map(|info| WriteDescriptorSet::buffer(2, info));
+            desc_set_writes.extend(psvr2_params_buffer_descriptor);
             DescriptorSet::new(
                 descriptor_set_allocator,
                 pipeline.layout().set_layouts().first().unwrap(),
@@ -528,6 +629,8 @@ impl Pipeline {
             correction,
             capture: false,
             camera_config: camera_config.copied(),
+            psvr2_calibration: psvr2_calibration.cloned(),
+            psvr2_params,
             input_image_buffer: cpu_buffer,
             input_image_gpu: input_texture,
             postprocessed_image,
@@ -546,6 +649,18 @@ impl Pipeline {
             .map(|c| c.fov())
             .unwrap_or([Vec2::new(1.19, 1.19); 2])
     }
+    pub fn psvr2_projection_fov(&self) -> Option<[[f32; 4]; 2]> {
+        self.psvr2_calibration.as_ref().map(|calibration| {
+            let [fx, fy, cx, cy] = calibration.rectified_intrinsics();
+            let fov = [
+                -(cx / fx).atan(),
+                ((1016.0 - cx) / fx).atan(),
+                (cy / fy).atan(),
+                -((1016.0 - cy) / fy).atan(),
+            ];
+            [fov; 2]
+        })
+    }
     /// Run the pipeline
     ///
     /// # Arguments
@@ -557,10 +672,16 @@ impl Pipeline {
         }
         let mut previous_fut = self.previous_upload_end.take();
         if let Some(f) = &mut previous_fut {
+            // A new camera frame arrives far less often than display frames. Waiting here
+            // protects the reused staging buffer without queueing stale camera frames.
             f.wait(None)?;
             f.cleanup_finished();
         }
-
+        if let (Some(ipd_m), Some(params)) = (frame.ipd_m, self.psvr2_params.as_ref()) {
+            if ipd_m.is_finite() && (0.05..=0.09).contains(&ipd_m) {
+                params.write()?.eye_and_depth[0] = ipd_m;
+            }
+        }
         self.previous_upload_end = Some(Arc::new(if frame.needs_postprocess {
             {
                 let buffer = Subbuffer::new(self.input_image_buffer.clone());
@@ -635,6 +756,7 @@ impl Pipeline {
                 .boxed_send_sync()
                 .then_signal_fence_and_flush()?
         }));
+        self.previous_frame_time = Some(frame.frame_time);
         Ok(())
     }
     /// Return the post-processed image and the fence signal future to wait on for the image to be
@@ -661,6 +783,17 @@ impl Pipeline {
 }
 
 mod fs {
+    pub mod psvr2_bc4 {
+        vulkano_shaders::shader! {
+            ty: "fragment",
+            path: "shaders/combined.frag",
+            define: [
+                ("PSVR2_RECTIFY", "1"),
+            ],
+            custom_derives: [Copy, Clone, Debug],
+        }
+    }
+
     pub mod yuyv_undistort {
         vulkano_shaders::shader! {
             ty: "fragment",
