@@ -34,6 +34,7 @@ fn xrcvt(e: XrErr) -> Result<(), XrErr> {
 struct CameraResources {
     camera: crate::camera::CameraThread,
     pp: crate::pipeline::Pipeline,
+    blit_future: Option<Box<dyn vulkano::sync::GpuFuture + Send + Sync>>,
 }
 
 struct PassthroughMesh<'a> {
