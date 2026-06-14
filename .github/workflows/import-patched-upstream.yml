@@ -1,0 +1,35 @@
+name: Import patched OpenXR passthrough layer
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/import-patched-upstream.yml
+      - patches/psvr2-passthrough.patch.gz
+
+permissions:
+  contents: write
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Import upstream and apply PSVR2 passthrough patch
+        env:
+          TARGET_REPOSITORY: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          gzip -dc patches/psvr2-passthrough.patch.gz \
+            > "$RUNNER_TEMP/psvr2-passthrough.patch"
+          git clone --branch next --single-branch \
+            https://github.com/yshui/xr_passthrough_layer.git work
+          cd work
+          git apply --index "$RUNNER_TEMP/psvr2-passthrough.patch"
+          git -c user.name="BellTower" \
+              -c user.email="josemo360@yahoo.com" \
+              commit -m "Add calibrated PSVR2 passthrough support"
+          git remote set-url origin \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${TARGET_REPOSITORY}.git"
+          git push --force origin HEAD:refs/heads/psvr2-passthrough
